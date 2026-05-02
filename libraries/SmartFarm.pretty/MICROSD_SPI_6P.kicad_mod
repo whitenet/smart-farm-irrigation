@@ -1,0 +1,11 @@
+(footprint "MICROSD_SPI_6P"
+  (version 20221018) (generator "ChatGPT") (layer "F.Cu")
+  (fp_text reference "REF**" (at 0 -3 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_rect (start -10 -3) (end 10 3) (layer "F.SilkS") (width 0.12) (fill none))
+  (pad "VCC" thru_hole rect (at -6.35 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask"))
+  (pad "GND" thru_hole circle (at -3.81 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask"))
+  (pad "CS" thru_hole circle (at -1.27 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask"))
+  (pad "SCK" thru_hole circle (at 1.27 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask"))
+  (pad "MOSI" thru_hole circle (at 3.81 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask"))
+  (pad "MISO" thru_hole circle (at 6.35 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask"))
+)
