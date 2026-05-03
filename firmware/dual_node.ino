@@ -8,10 +8,8 @@
 // ================= USER CONFIG =================
 #define NODE_ID 1
 
-// MAC centralnego ESP32
 uint8_t centralMac[] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
 
-// Deep sleep co 1h
 #define SLEEP_SECONDS 3600
 
 // ================= PINOUT =================
@@ -23,6 +21,15 @@ uint8_t centralMac[] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
 
 #define LED_PIN      2
 
+// ================= INA219 ADDRESSES =================
+// Battery / load INA219 = 0x40
+// Solar INA219          = 0x41
+Adafruit_INA219 inaBattery(0x40);
+Adafruit_INA219 inaSolar(0x41);
+
+bool inaBatteryReady = false;
+bool inaSolarReady = false;
+
 // ================= BATTERY 18650 3S =================
 const float BAT_FULL     = 12.6;
 const float BAT_OK       = 11.5;
@@ -33,17 +40,25 @@ const float BAT_EMPTY    = 10.2;
 #define FLAG_BAT_LOW       0x01
 #define FLAG_BAT_CRITICAL  0x02
 #define FLAG_PUMP_BLOCKED  0x04
-
-// ================= INA219 =================
-Adafruit_INA219 ina219;
-bool inaReady = false;
+#define FLAG_SOLAR_CHARGE  0x08
+#define FLAG_INA_BAT_OK    0x10
+#define FLAG_INA_SOLAR_OK  0x20
 
 // ================= PACKETS =================
 typedef struct {
   uint8_t nodeID;
+
   float moistureA;
   float moistureB;
-  float voltage;
+
+  float batteryVoltage;
+  float batteryCurrent_mA;
+  float batteryPower_mW;
+
+  float solarVoltage;
+  float solarCurrent_mA;
+  float solarPower_mW;
+
   uint8_t flags;
 } SensorPacket;
 
@@ -60,7 +75,7 @@ uint8_t lastFlags = 0;
 float readMoisturePercent(int pin) {
   int raw = analogRead(pin);
 
-  // Kalibracja do poprawy pod Twoje czujniki:
+  // Kalibracja:
   // dry ~3200, wet ~1500
   float pct = map(raw, 3200, 1500, 0, 100);
 
@@ -70,22 +85,35 @@ float readMoisturePercent(int pin) {
   return pct;
 }
 
+float safeBusVoltage(Adafruit_INA219 &ina, bool ready) {
+  if (!ready) return 0.0;
+  return ina.getBusVoltage_V();
+}
+
+float safeCurrent_mA(Adafruit_INA219 &ina, bool ready) {
+  if (!ready) return 0.0;
+  return ina.getCurrent_mA();
+}
+
+float safePower_mW(Adafruit_INA219 &ina, bool ready) {
+  if (!ready) return 0.0;
+  return ina.getPower_mW();
+}
+
 float readBatteryVoltage() {
-  if (inaReady) {
-    return ina219.getBusVoltage_V();
+  if (inaBatteryReady) {
+    return inaBattery.getBusVoltage_V();
   }
 
-  // Fallback jeśli nie ma INA219.
-  // Ustaw własny dzielnik napięcia jeśli używasz ADC.
-  return 12.0;
+  return 0.0;
 }
 
 bool batteryLow(float v) {
-  return v <= BAT_LOW;
+  return v > 0.1 && v <= BAT_LOW;
 }
 
 bool batteryCritical(float v) {
-  return v <= BAT_CRITICAL;
+  return v > 0.1 && v <= BAT_CRITICAL;
 }
 
 float batteryPercent(float v) {
@@ -94,11 +122,20 @@ float batteryPercent(float v) {
   return ((v - BAT_EMPTY) / (BAT_FULL - BAT_EMPTY)) * 100.0;
 }
 
-uint8_t batteryFlags(float v) {
+uint8_t buildFlags(float batteryVoltage,
+                   float solarVoltage,
+                   float solarCurrent_mA) {
   uint8_t f = 0;
 
-  if (batteryLow(v)) f |= FLAG_BAT_LOW;
-  if (batteryCritical(v)) f |= FLAG_BAT_CRITICAL;
+  if (inaBatteryReady) f |= FLAG_INA_BAT_OK;
+  if (inaSolarReady) f |= FLAG_INA_SOLAR_OK;
+
+  if (batteryLow(batteryVoltage)) f |= FLAG_BAT_LOW;
+  if (batteryCritical(batteryVoltage)) f |= FLAG_BAT_CRITICAL;
+
+  if (solarVoltage > batteryVoltage + 0.2 && solarCurrent_mA > 5.0) {
+    f |= FLAG_SOLAR_CHARGE;
+  }
 
   return f;
 }
@@ -180,8 +217,20 @@ void sendStatus() {
   data.nodeID = NODE_ID;
   data.moistureA = readMoisturePercent(SENSOR_A_PIN);
   data.moistureB = readMoisturePercent(SENSOR_B_PIN);
-  data.voltage   = readBatteryVoltage();
-  data.flags     = batteryFlags(data.voltage) | lastFlags;
+
+  data.batteryVoltage    = safeBusVoltage(inaBattery, inaBatteryReady);
+  data.batteryCurrent_mA = safeCurrent_mA(inaBattery, inaBatteryReady);
+  data.batteryPower_mW   = safePower_mW(inaBattery, inaBatteryReady);
+
+  data.solarVoltage    = safeBusVoltage(inaSolar, inaSolarReady);
+  data.solarCurrent_mA = safeCurrent_mA(inaSolar, inaSolarReady);
+  data.solarPower_mW   = safePower_mW(inaSolar, inaSolarReady);
+
+  data.flags = buildFlags(
+                 data.batteryVoltage,
+                 data.solarVoltage,
+                 data.solarCurrent_mA
+               ) | lastFlags;
 
   esp_err_t result = esp_now_send(
     centralMac,
@@ -197,8 +246,18 @@ void sendStatus() {
 
   Serial.printf("A: %.1f %%\n", data.moistureA);
   Serial.printf("B: %.1f %%\n", data.moistureB);
-  Serial.printf("Batt: %.2f V\n", data.voltage);
-  Serial.printf("Batt percent: %.0f %%\n", batteryPercent(data.voltage));
+
+  Serial.println("BATTERY INA219:");
+  Serial.printf("Voltage: %.2f V\n", data.batteryVoltage);
+  Serial.printf("Current: %.1f mA\n", data.batteryCurrent_mA);
+  Serial.printf("Power: %.1f mW\n", data.batteryPower_mW);
+  Serial.printf("Percent: %.0f %%\n", batteryPercent(data.batteryVoltage));
+
+  Serial.println("SOLAR INA219:");
+  Serial.printf("Voltage: %.2f V\n", data.solarVoltage);
+  Serial.printf("Current: %.1f mA\n", data.solarCurrent_mA);
+  Serial.printf("Power: %.1f mW\n", data.solarPower_mW);
+
   Serial.printf("Flags: %u\n", data.flags);
 }
 
@@ -227,14 +286,22 @@ void setup() {
 
   analogReadResolution(12);
 
-  Wire.begin();
+  Wire.begin(21, 22);
 
-  if (ina219.begin()) {
-    inaReady = true;
-    Serial.println("INA219 OK");
+  if (inaBattery.begin()) {
+    inaBatteryReady = true;
+    Serial.println("INA219 BATTERY OK @0x40");
   } else {
-    inaReady = false;
-    Serial.println("INA219 not found - fallback voltage");
+    inaBatteryReady = false;
+    Serial.println("INA219 BATTERY not found @0x40");
+  }
+
+  if (inaSolar.begin()) {
+    inaSolarReady = true;
+    Serial.println("INA219 SOLAR OK @0x41");
+  } else {
+    inaSolarReady = false;
+    Serial.println("INA219 SOLAR not found @0x41");
   }
 
   WiFi.mode(WIFI_STA);
@@ -275,6 +342,5 @@ void setup() {
   goSleep();
 }
 
-// ================= LOOP =================
 void loop() {
 }
