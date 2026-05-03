@@ -1,21 +1,17 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <esp_now.h>
-#include <esp_wifi.h>
 #include <Preferences.h>
 
-// ================= WIFI =================
 const char* WIFI_SSID = "YOUR_WIFI_NAME";
 const char* WIFI_PASS = "YOUR_WIFI_PASS";
 
-// ================= SYSTEM =================
 #define MAX_NODES 10
 #define HISTORY_SIZE 24
 
 WebServer server(80);
 Preferences prefs;
 
-// ================= SMART WATERING =================
 bool autoMode = true;
 bool holidayMode = false;
 
@@ -25,7 +21,6 @@ const unsigned long WATER_INTERVAL = 6UL * 60UL * 60UL * 1000UL;
 float DRY_LEVEL = 35.0;
 float OK_LEVEL  = 55.0;
 
-// ================= BATTERY 18650 3S =================
 const float BAT_FULL     = 12.6;
 const float BAT_OK       = 11.5;
 const float BAT_LOW      = 10.8;
@@ -35,13 +30,24 @@ const float BAT_EMPTY    = 10.2;
 #define FLAG_BAT_LOW       0x01
 #define FLAG_BAT_CRITICAL  0x02
 #define FLAG_PUMP_BLOCKED  0x04
+#define FLAG_SOLAR_CHARGE  0x08
+#define FLAG_INA_BAT_OK    0x10
+#define FLAG_INA_SOLAR_OK  0x20
 
-// ================= STRUCTS =================
 typedef struct {
   uint8_t nodeID;
+
   float moistureA;
   float moistureB;
-  float voltage;
+
+  float batteryVoltage;
+  float batteryCurrent_mA;
+  float batteryPower_mW;
+
+  float solarVoltage;
+  float solarCurrent_mA;
+  float solarPower_mW;
+
   uint8_t flags;
 } SensorPacket;
 
@@ -57,7 +63,16 @@ struct NodeData {
 
   float moistureA;
   float moistureB;
-  float voltage;
+
+  float batteryVoltage;
+  float batteryCurrent_mA;
+  float batteryPower_mW;
+
+  float solarVoltage;
+  float solarCurrent_mA;
+  float solarPower_mW;
+
+  uint8_t flags;
 
   float voltageFiltered = 0;
   float batteryPercent = 0;
@@ -80,7 +95,6 @@ struct NodeData {
 NodeData nodes[MAX_NODES];
 int nodeCount = 0;
 
-// ================= UTIL =================
 String macToString(const uint8_t *mac) {
   char s[18];
   sprintf(s, "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -128,7 +142,6 @@ void loadPrefs() {
   }
 }
 
-// ================= BATTERY PRO =================
 float calcBatteryPercent(float v) {
   if (v >= BAT_FULL) return 100;
   if (v <= BAT_EMPTY) return 0;
@@ -136,6 +149,8 @@ float calcBatteryPercent(float v) {
 }
 
 void updateSmartBattery(int idx, float newVoltage) {
+  if (newVoltage <= 0.1) return;
+
   if (nodes[idx].voltageFiltered == 0) {
     nodes[idx].voltageFiltered = newVoltage;
     nodes[idx].batteryStartVoltage = newVoltage;
@@ -177,7 +192,6 @@ void updateSmartBattery(int idx, float newVoltage) {
   }
 
   nodes[idx].dropPerDay = drop / (hours / 24.0);
-
   float remaining = nodes[idx].voltageFiltered - BAT_EMPTY;
   nodes[idx].daysLeft = remaining / nodes[idx].dropPerDay;
 
@@ -188,7 +202,6 @@ bool batteryAllowsWatering(int idx) {
   return nodes[idx].voltageFiltered > BAT_LOW;
 }
 
-// ================= WATER LOGIC =================
 int calcWaterTime(float moisture, float batt) {
   if (batt < BAT_LOW) return 0;
   if (batt < BAT_OK) return 60;
@@ -242,12 +255,11 @@ void scheduler() {
   lastWaterCycle = millis();
 }
 
-// ================= ESP-NOW RECEIVE =================
 void onRecv(const esp_now_recv_info_t *info,
             const uint8_t *data,
             int len) {
   if (len != sizeof(SensorPacket)) {
-    Serial.println("Invalid packet size");
+    Serial.printf("Invalid packet size: %d expected %d\n", len, sizeof(SensorPacket));
     return;
   }
 
@@ -273,9 +285,18 @@ void onRecv(const esp_now_recv_info_t *info,
   if (idx >= 0) {
     nodes[idx].moistureA = p.moistureA;
     nodes[idx].moistureB = p.moistureB;
-    nodes[idx].voltage   = p.voltage;
 
-    updateSmartBattery(idx, p.voltage);
+    nodes[idx].batteryVoltage = p.batteryVoltage;
+    nodes[idx].batteryCurrent_mA = p.batteryCurrent_mA;
+    nodes[idx].batteryPower_mW = p.batteryPower_mW;
+
+    nodes[idx].solarVoltage = p.solarVoltage;
+    nodes[idx].solarCurrent_mA = p.solarCurrent_mA;
+    nodes[idx].solarPower_mW = p.solarPower_mW;
+
+    nodes[idx].flags = p.flags;
+
+    updateSmartBattery(idx, p.batteryVoltage);
 
     nodes[idx].online = true;
     nodes[idx].lastSeen = millis();
@@ -285,17 +306,32 @@ void onRecv(const esp_now_recv_info_t *info,
     nodes[idx].histIndex++;
     if (nodes[idx].histIndex >= HISTORY_SIZE) nodes[idx].histIndex = 0;
 
-    Serial.printf("RX Node %d | A %.1f%% | B %.1f%% | Batt %.2fV | %.0f%% | Flags %u\n",
+    Serial.printf("RX Node %d | A %.1f%% | B %.1f%% | BAT %.2fV %.1fmA %.1fmW | SOL %.2fV %.1fmA %.1fmW | Flags %u\n",
                   nodes[idx].id,
                   nodes[idx].moistureA,
                   nodes[idx].moistureB,
-                  nodes[idx].voltageFiltered,
-                  nodes[idx].batteryPercent,
-                  p.flags);
+                  nodes[idx].batteryVoltage,
+                  nodes[idx].batteryCurrent_mA,
+                  nodes[idx].batteryPower_mW,
+                  nodes[idx].solarVoltage,
+                  nodes[idx].solarCurrent_mA,
+                  nodes[idx].solarPower_mW,
+                  nodes[idx].flags);
   }
 }
 
-// ================= WEB UI =================
+String flagText(uint8_t f) {
+  String s = "";
+  if (f & FLAG_BAT_LOW) s += "BAT_LOW ";
+  if (f & FLAG_BAT_CRITICAL) s += "BAT_CRITICAL ";
+  if (f & FLAG_PUMP_BLOCKED) s += "PUMP_BLOCKED ";
+  if (f & FLAG_SOLAR_CHARGE) s += "SOLAR_CHARGE ";
+  if (f & FLAG_INA_BAT_OK) s += "INA_BAT_OK ";
+  if (f & FLAG_INA_SOLAR_OK) s += "INA_SOLAR_OK ";
+  if (s == "") s = "OK";
+  return s;
+}
+
 String page() {
   String h = "<html><head>";
   h += "<meta name='viewport' content='width=device-width'>";
@@ -304,6 +340,7 @@ String page() {
   h += ".box{border:1px solid #444;padding:10px;margin:10px;border-radius:10px}";
   h += "button{padding:10px;margin:4px;font-size:16px}";
   h += "input{font-size:16px;width:120px}";
+  h += ".bad{color:red;font-weight:bold}.warn{color:orange;font-weight:bold}.ok{color:#4cff4c}";
   h += "</style></head><body>";
 
   h += "<h2>SMART FARM CENTRAL</h2>";
@@ -323,10 +360,17 @@ String page() {
     h += "<b>" + String(nodes[i].name) + "</b><br>";
     h += "ID: " + String(nodes[i].id) + "<br>";
     h += "MAC: " + macToString(nodes[i].mac) + "<br>";
-    h += "A: " + String(nodes[i].moistureA, 1) + "%<br>";
-    h += "B: " + String(nodes[i].moistureB, 1) + "%<br>";
+    h += "Status: ";
+    h += alive ? "<span class='ok'>ONLINE</span><br>" : "<span class='bad'>OFFLINE</span><br>";
 
-    h += "Battery raw: " + String(nodes[i].voltage, 2) + "V<br>";
+    h += "<hr>";
+    h += "Moisture A: " + String(nodes[i].moistureA, 1) + "%<br>";
+    h += "Moisture B: " + String(nodes[i].moistureB, 1) + "%<br>";
+
+    h += "<hr><b>Battery INA219</b><br>";
+    h += "Battery voltage: " + String(nodes[i].batteryVoltage, 2) + "V<br>";
+    h += "Battery current: " + String(nodes[i].batteryCurrent_mA, 1) + "mA<br>";
+    h += "Battery power: " + String(nodes[i].batteryPower_mW, 1) + "mW<br>";
     h += "Battery filtered: " + String(nodes[i].voltageFiltered, 2) + "V<br>";
     h += "Battery: " + String(nodes[i].batteryPercent, 0) + "%<br>";
 
@@ -339,16 +383,25 @@ String page() {
       h += String(nodes[i].daysLeft, 1) + " days<br>";
     }
 
-    if (nodes[i].voltageFiltered <= BAT_CRITICAL) {
-      h += "<b style='color:red'>CRITICAL BATTERY - WATERING BLOCKED</b><br>";
-    } else if (nodes[i].voltageFiltered <= BAT_LOW) {
-      h += "<b style='color:orange'>LOW BATTERY - WATERING BLOCKED</b><br>";
+    h += "<hr><b>Solar INA219</b><br>";
+    h += "Solar voltage: " + String(nodes[i].solarVoltage, 2) + "V<br>";
+    h += "Solar current: " + String(nodes[i].solarCurrent_mA, 1) + "mA<br>";
+    h += "Solar power: " + String(nodes[i].solarPower_mW, 1) + "mW<br>";
+
+    if (nodes[i].flags & FLAG_SOLAR_CHARGE) {
+      h += "<span class='ok'>Solar charging detected</span><br>";
     }
 
-    h += "Status: ";
-    h += alive ? "ONLINE" : "OFFLINE";
-    h += "<br>";
+    h += "<hr>";
+    h += "Flags: " + flagText(nodes[i].flags) + "<br>";
 
+    if (nodes[i].voltageFiltered <= BAT_CRITICAL || (nodes[i].flags & FLAG_BAT_CRITICAL)) {
+      h += "<span class='bad'>CRITICAL BATTERY - WATERING BLOCKED</span><br>";
+    } else if (nodes[i].voltageFiltered <= BAT_LOW || (nodes[i].flags & FLAG_BAT_LOW)) {
+      h += "<span class='warn'>LOW BATTERY - WATERING BLOCKED</span><br>";
+    }
+
+    h += "<hr>";
     h += "<input id='name" + String(i) + "' value='" + String(nodes[i].name) + "'>";
     h += "<button onclick=\"setName(" + String(i) + ")\">SET NAME</button><br>";
 
@@ -371,7 +424,6 @@ function setName(i){
   return h;
 }
 
-// ================= WEB ROUTES =================
 void setupWeb() {
   server.on("/", []() {
     server.send(200, "text/html", page());
@@ -427,7 +479,6 @@ void setupWeb() {
   server.begin();
 }
 
-// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -463,7 +514,6 @@ void setup() {
   Serial.println("CENTRAL READY");
 }
 
-// ================= LOOP =================
 void loop() {
   server.handleClient();
   scheduler();
